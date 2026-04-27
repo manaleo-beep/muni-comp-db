@@ -113,46 +113,129 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["📤 Upload Data","🔍 Compare Municipalities","📊 Position Benchmark","🔗 Title Mapping","📋 Browse Raw Data"])
 
 # ---- TAB 1: UPLOAD ----
+def safe_str(v):
+    if v is None: return None
+    if isinstance(v, float) and pd.isna(v): return None
+    return str(v).strip() or None
+
+def safe_int(v, default=None):
+    try:
+        if v is None or (isinstance(v, float) and pd.isna(v)): return default
+        return int(float(v))
+    except (ValueError, TypeError):
+        return default
+
+def safe_float(v, default=None):
+    try:
+        if v is None or (isinstance(v, float) and pd.isna(v)): return default
+        return float(v)
+    except (ValueError, TypeError):
+        return default
+
 with tab1:
-    st.header("Upload Excel Compensation File")
+    st.header("Upload Excel / CSV Compensation File")
     st.markdown("""
-    **Required columns** (any order, case-insensitive):  
-    `municipality, state, fiscal_year, position_title, actual_salary`  
+    **Required columns:** `municipality`, `state`, `fiscal_year`, `position_title`, `actual_salary`  
     **Optional:** `population, min_salary, max_salary, hourly_rate, hours_per_week, benefits_pct, total_comp, county, form_of_government`
+    
+    *Column names are case-insensitive. Spaces are auto-converted to underscores.*
     """)
     up = st.file_uploader("Choose Excel/CSV file", type=["xlsx","xls","csv"])
+
     if up:
-        df = pd.read_excel(up) if up.name.endswith(("xlsx","xls")) else pd.read_csv(up)
-        df.columns = [c.lower().strip().replace(" ","_") for c in df.columns]
-        st.dataframe(df.head())
-        if st.button("Import to Database"):
-            inserted, unmapped = 0, []
-            for _,r in df.iterrows():
-                # municipality
-                mid = exec_sql("""INSERT OR IGNORE INTO municipalities
-                    (name,state,fiscal_year,population,county,form_of_government)
-                    VALUES(?,?,?,?,?,?)""",
-                    (r.get("municipality"), r.get("state"), int(r.get("fiscal_year",2024)),
-                     int(r.get("population",0) or 0), r.get("county"), r.get("form_of_government")))
-                row = q("SELECT id FROM municipalities WHERE name=? AND state=? AND fiscal_year=?",
-                        (r.get("municipality"), r.get("state"), int(r.get("fiscal_year",2024))))
-                mid = int(row.iloc[0,0])
-                # position
-                pid = map_title_to_position(str(r.get("position_title","")))
-                if pid is None:
-                    unmapped.append(r.get("position_title")); continue
-                exec_sql("""INSERT INTO compensation
-                    (municipality_id,position_id,fiscal_year,min_salary,max_salary,
-                     actual_salary,hourly_rate,hours_per_week,benefits_pct,total_comp)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    (mid,pid,int(r.get("fiscal_year",2024)),
-                     r.get("min_salary"), r.get("max_salary"),
-                     r.get("actual_salary"), r.get("hourly_rate"),
-                     r.get("hours_per_week"), r.get("benefits_pct"), r.get("total_comp")))
-                inserted += 1
-            st.success(f"Imported {inserted} rows.")
+        try:
+            if up.name.lower().endswith(".csv"):
+                df = pd.read_csv(up)
+            else:
+                df = pd.read_excel(up, engine="openpyxl")
+        except Exception as e:
+            st.error(f"❌ Could not read file: {e}")
+            st.stop()
+
+        # Normalize column names
+        df.columns = [str(c).lower().strip().replace(" ","_").replace("-","_") for c in df.columns]
+        # Drop fully empty rows
+        df = df.dropna(how="all").reset_index(drop=True)
+
+        # Validate required columns
+        required = {"municipality","state","fiscal_year","position_title","actual_salary"}
+        missing = required - set(df.columns)
+        if missing:
+            st.error(f"❌ Missing required column(s): {missing}")
+            st.write("Columns found in your file:", list(df.columns))
+            st.stop()
+
+        st.success(f"✅ File parsed. {len(df)} data rows detected.")
+        st.dataframe(df.head(10))
+
+        if st.button("🚀 Import to Database"):
+            inserted, skipped, unmapped = 0, [], []
+            errors = []
+            progress = st.progress(0)
+
+            for i, r in df.iterrows():
+                progress.progress((i+1)/len(df))
+                try:
+                    muni = safe_str(r.get("municipality"))
+                    state = safe_str(r.get("state"))
+                    fy = safe_int(r.get("fiscal_year"), 2024)
+                    title = safe_str(r.get("position_title"))
+                    salary = safe_float(r.get("actual_salary"))
+
+                    # Skip rows missing the essentials
+                    if not muni or not state or not title:
+                        skipped.append(f"Row {i+2}: missing muni/state/title")
+                        continue
+
+                    # Insert/find municipality
+                    exec_sql("""INSERT OR IGNORE INTO municipalities
+                        (name,state,fiscal_year,population,county,form_of_government)
+                        VALUES(?,?,?,?,?,?)""",
+                        (muni, state, fy,
+                         safe_int(r.get("population"), 0),
+                         safe_str(r.get("county")),
+                         safe_str(r.get("form_of_government"))))
+                    row = q("SELECT id FROM municipalities WHERE name=? AND state=? AND fiscal_year=?",
+                            (muni, state, fy))
+                    if row.empty:
+                        errors.append(f"Row {i+2}: could not create/find municipality '{muni}'")
+                        continue
+                    mid = int(row.iloc[0,0])
+
+                    # Map title → standard position
+                    pid = map_title_to_position(title)
+                    if pid is None:
+                        unmapped.append(title)
+                        continue
+
+                    exec_sql("""INSERT INTO compensation
+                        (municipality_id,position_id,fiscal_year,min_salary,max_salary,
+                         actual_salary,hourly_rate,hours_per_week,benefits_pct,total_comp)
+                        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        (mid, pid, fy,
+                         safe_float(r.get("min_salary")),
+                         safe_float(r.get("max_salary")),
+                         salary,
+                         safe_float(r.get("hourly_rate")),
+                         safe_float(r.get("hours_per_week")),
+                         safe_float(r.get("benefits_pct")),
+                         safe_float(r.get("total_comp"))))
+                    inserted += 1
+                except Exception as e:
+                    errors.append(f"Row {i+2}: {e}")
+
+            progress.empty()
+            st.success(f"✅ Imported {inserted} rows.")
+            if skipped:
+                with st.expander(f"⚠️ Skipped {len(skipped)} rows (missing required data)"):
+                    for s in skipped[:50]: st.text(s)
             if unmapped:
-                st.warning(f"Unmapped titles (add via Title Mapping tab): {set(unmapped)}")
+                unique_unmapped = sorted(set(unmapped))
+                with st.expander(f"🔗 {len(unique_unmapped)} unmapped position titles — add these in the Mapping tab"):
+                    for t in unique_unmapped: st.text(f"• {t}")
+            if errors:
+                with st.expander(f"❌ {len(errors)} errors"):
+                    for e in errors[:50]: st.text(e)
 
 # ---- TAB 2: COMPARE ----
 with tab2:
